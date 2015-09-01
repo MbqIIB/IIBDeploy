@@ -1,0 +1,234 @@
+
+
+CREATE COMPUTE MODULE InsertMonitoringEvent_InsertEvent
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		
+		DECLARE wmb NAMESPACE 'http://www.ibm.com/xmlns/prod/websphere/messagebroker/6.1.0/monitoring/event';
+		DECLARE rEventPointData 		REFERENCE TO InputRoot.XMLNSC.wmb:event.wmb:eventPointData;
+		DECLARE rEventData 				REFERENCE TO rEventPointData.wmb:eventData;
+		DECLARE rMessageFlowData 		REFERENCE TO rEventPointData.wmb:messageFlowData;
+		DECLARE rApplicationData 		REFERENCE TO InputRoot.XMLNSC.wmb:event.wmb:applicationData;
+		DECLARE rSimpleContent 			REFERENCE TO rApplicationData.wmb:simpleContent[1];	
+		DECLARE rComplexContent 		REFERENCE TO rApplicationData.wmb:complexContent[1];
+		
+		DECLARE vMsgId CHARACTER SUBSTRING(CAST(InputRoot.MQMD.MsgId AS CHAR) FROM 3);
+		SET vMsgId = SUBSTRING(vMsgId BEFORE '''');
+		DECLARE vCorrelId CHARACTER SUBSTRING(CAST(InputRoot.MQMD.CorrelId AS CHAR) FROM 3);
+		SET vCorrelId = SUBSTRING(vCorrelId BEFORE '''');
+		DECLARE vKeyId CHARACTER COALESCE(vCorrelId || ':' || vMsgId, '');
+		
+		DECLARE vHAS_BITSTREAM CHARACTER 'N';
+		DECLARE vHAS_EXCEPTION CHARACTER 'N';
+		DECLARE vHAS_USERDATA  CHARACTER 'N';
+		
+		DECLARE vKEY_FLD_1_NM CHARACTER '';
+		DECLARE vKEY_FLD_2_NM CHARACTER '';
+		DECLARE vKEY_FLD_3_NM CHARACTER '';
+		DECLARE vKEY_FLD_4_NM CHARACTER '';
+		DECLARE vKEY_FLD_5_NM CHARACTER '';
+		
+		CREATE FIELD Environment.ApplicationData;
+		DECLARE rEnvSimpleContent REFERENCE TO Environment.ApplicationData;
+		DECLARE vSimpleContentFieldName CHARACTER '';
+		DECLARE vDuplicateValue BOOLEAN FALSE;
+		
+		-- Process SimpleContent and remove multiple occurances of same element with balnk value, which is a bug of IIBv9.0.0.3
+		WHILE LASTMOVE(rSimpleContent) DO
+			SET vSimpleContentFieldName = rSimpleContent.(XMLNSC.Attribute)wmb:name;
+			SET vDuplicateValue = FALSE;
+			
+			FOR tSimpleContent AS Environment.ApplicationData.SimpleContent[] DO
+				IF tSimpleContent.Name = vSimpleContentFieldName THEN
+					SET vDuplicateValue = TRUE;
+					IF TRIM(tSimpleContent.Value) = '' THEN
+						SET tSimpleContent.Value = COALESCE(rSimpleContent.(XMLNSC.Attribute)wmb:value, '');
+					END IF;
+				END IF;
+			END FOR;
+			
+			IF vDuplicateValue = FALSE THEN
+				CREATE LASTCHILD OF Environment.ApplicationData AS rEnvSimpleContent NAME 'SimpleContent';
+				SET rEnvSimpleContent.Name = rSimpleContent.(XMLNSC.Attribute)wmb:name;
+				SET rEnvSimpleContent.Value = COALESCE(rSimpleContent.(XMLNSC.Attribute)wmb:value, '');
+			END IF;
+			
+			MOVE rSimpleContent NEXTSIBLING REPEAT TYPE NAME;
+		END WHILE;
+		
+		-- Assign Key fields
+		DECLARE vCount INTEGER 1;
+		FOR tSimpleContent AS Environment.ApplicationData.SimpleContent[] DO
+			IF vCount = 1 THEN
+				SET vKEY_FLD_1_NM = tSimpleContent.Name || ' : ' || tSimpleContent.Value;
+			ELSEIF vCount = 2 THEN
+				SET vKEY_FLD_2_NM = tSimpleContent.Name || ' : ' || tSimpleContent.Value;
+			ELSEIF vCount = 3 THEN
+				SET vKEY_FLD_3_NM = tSimpleContent.Name || ' : ' || tSimpleContent.Value;
+			ELSEIF vCount = 4 THEN
+				SET vKEY_FLD_4_NM = tSimpleContent.Name || ' : ' || tSimpleContent.Value;
+			ELSEIF vCount = 5 THEN
+				SET vKEY_FLD_5_NM = tSimpleContent.Name || ' : ' || tSimpleContent.Value;
+			END IF;
+			
+			SET vCount = vCount + 1;			
+		END FOR;	
+		
+		-- Retrieve all Complex Contents		
+		DECLARE options INTEGER BITOR(FolderBitStream, ValidateNone);
+		DECLARE vComplexContentData BLOB;
+		DECLARE vComplexContent CHARACTER '';
+		DECLARE vSeqNo INTEGER 1;
+		
+		WHILE LASTMOVE(rComplexContent) DO
+			
+			DECLARE rFirstChild REFERENCE TO rComplexContent;
+			MOVE rFirstChild LASTCHILD;
+			SET vComplexContentData = ASBITSTREAM(rFirstChild,,InputRoot.Properties.CodedCharSetId,,,,options);
+			SET vComplexContent = CAST(vComplexContentData AS CHARACTER CCSID InputRoot.Properties.CodedCharSetId ENCODING InputRoot.Properties.Encoding);
+						
+			-- Check if it is ExceptionList, then insert into WMB_BINARY_DATA table, otherwise inseret into WMB_USER_DATA table
+			IF rComplexContent.(XMLNSC.Attribute)wmb:elementName = 'ExceptionList' THEN
+				SET vHAS_EXCEPTION = 'Y';		
+				INSERT INTO Database.WMB.WMB_BINARY_DATA (
+					WMB_MSGKEY,
+					DATA_TYPE,
+					ENCODING,
+					DATA
+				)
+				VALUES (
+					vKeyId,
+					20,
+					'none',
+					vComplexContent
+				);
+			ELSE
+				INSERT INTO Database.WMB.WMB_USER_BINARY_DATA (
+					WMB_MSGKEY,
+					KEY_FLD_SEQ,
+					ENCODING,
+					KEY_FLD_ELEM_NAME,
+					DATA
+				)
+				VALUES (
+					vKeyId,
+					vSeqNo,
+					'base64Binary',
+					COALESCE(rComplexContent.(XMLNSC.Attribute)wmb:elementName, 'none'),
+					BASE64ENCODE(vComplexContent)
+				);
+				SET vSeqNo = vSeqNo + 1;
+			END IF;
+			
+			MOVE rComplexContent NEXTSIBLING REPEAT TYPE NAME;
+		END WHILE;		
+		
+		IF EXISTS(InputRoot.XMLNSC.wmb:event.wmb:bitstreamData.wmb:bitstream[]) THEN
+			SET vHAS_BITSTREAM = 'Y';
+		END IF;
+		
+		IF vSeqNo > 1 OR vCount > 1 THEN
+			SET vHAS_USERDATA = 'Y';
+		END IF;
+		
+		DECLARE vCreateDateTime CHARACTER COALESCE(rEventData.wmb:eventSequence.(XMLNSC.Attribute)wmb:creationTime, '');
+		SET vCreateDateTime = REPLACE(vCreateDateTime, 'T', ' ');
+		SET vCreateDateTime = REPLACE(vCreateDateTime, 'Z', '');
+		
+		-- Insert into WMB_MSGS table
+		INSERT INTO Database.WMB.WMB_MSGS (
+			  WMB_MSGKEY,                                    
+			  HAS_BITSTREAM,
+			  HAS_EXCEPTION,
+			  HAS_USERDATA,                                    
+			  EVENT_TYPE,			                                    
+			  EVENT_NAME,
+			  EVENT_SRCADDR,			                                    
+			  BROKER_NAME,
+			  BROKER_UUID,
+			  EXGRP_NAME,
+			  EXGRP_UUID,
+			  MSGFLOW_NAME,
+			  MSGFLOW_UUID,
+			  APPL_NAME,
+			  APPL_UUID,
+			  LIBRARY_NAME,
+			  LIBRARY_UUID,
+			  NODE_NAME,
+			  NODE_TYPE,
+			  DETAIL,
+			  TERMINAL_NAME,			                                    
+			  KEY_FLD_1_NM,
+			  KEY_FLD_2_NM,
+			  KEY_FLD_3_NM,
+			  KEY_FLD_4_NM,
+			  KEY_FLD_5_NM,			                                    
+			  EVENT_TIMESTAMP,			                                                
+			  LOCAL_TRANSACTION_ID,
+			  PARENT_TRANSACTION_ID,
+			  GLOBAL_TRANSACTION_ID
+			 )
+			 VALUES (
+			  vKeyId,
+			  vHAS_BITSTREAM,
+			  vHAS_EXCEPTION,
+			  vHAS_USERDATA,                                    
+			  COALESCE(rEventData.wmb:eventIdentity.(XMLNSC.Attribute)wmb:eventName, ''),			                                    
+			  COALESCE(rEventData.wmb:eventIdentity.(XMLNSC.Attribute)wmb:eventName, ''),
+			  COALESCE(rEventData.(XMLNSC.Attribute)wmb:eventSourceAddress, ''),
+			  COALESCE(rMessageFlowData.wmb:broker.(XMLNSC.Attribute)wmb:name, ''),
+			  COALESCE(rMessageFlowData.wmb:broker.(XMLNSC.Attribute)wmb:UUID, ''),
+			  COALESCE(rMessageFlowData.wmb:executionGroup.(XMLNSC.Attribute)wmb:name, ''),
+			  COALESCE(rMessageFlowData.wmb:executionGroup.(XMLNSC.Attribute)wmb:UUID, ''),
+			  COALESCE(rMessageFlowData.wmb:messageFlow.(XMLNSC.Attribute)wmb:name, ''),
+			  COALESCE(rMessageFlowData.wmb:messageFlow.(XMLNSC.Attribute)wmb:UUID, ''),
+			  '',
+			  '',
+			  '',
+			  '',
+			  COALESCE(rMessageFlowData.wmb:node.(XMLNSC.Attribute)wmb:nodeLabel, ''),
+			  COALESCE(rMessageFlowData.wmb:node.(XMLNSC.Attribute)wmb:nodeType, ''),
+			  '',
+			  COALESCE(rMessageFlowData.wmb:node.(XMLNSC.Attribute)wmb:terminal, ''),
+			  vKEY_FLD_1_NM,
+			  vKEY_FLD_2_NM,
+			  vKEY_FLD_3_NM,
+			  vKEY_FLD_4_NM,
+			  vKEY_FLD_5_NM,			                                    
+			  vCreateDateTime,
+			  COALESCE(rEventData.wmb:eventCorrelation.(XMLNSC.Attribute)wmb:localTransactionId, ''),
+			  COALESCE(rEventData.wmb:eventCorrelation.(XMLNSC.Attribute)wmb:parentTransactionId, ''),
+			  COALESCE(rEventData.wmb:eventCorrelation.(XMLNSC.Attribute)wmb:globalTransactionId, '')
+			 );
+		
+		-- Insert payload
+		INSERT INTO Database.WMB.WMB_BINARY_DATA (
+				WMB_MSGKEY,
+				DATA_TYPE,
+				ENCODING,
+				DATA
+			)
+			VALUES (
+				vKeyId,
+				10,
+				COALESCE(InputRoot.XMLNSC.wmb:event.wmb:bitstreamData.wmb:bitstream.(XMLNSC.Attribute)wmb:encoding, ''),
+				COALESCE(InputRoot.XMLNSC.wmb:event.wmb:bitstreamData.wmb:bitstream, '')
+			);
+		
+		RETURN TRUE;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+END MODULE;
